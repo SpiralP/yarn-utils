@@ -1,0 +1,160 @@
+#!/usr/bin/env deno --allow-env --allow-sys --allow-read --allow-run=yarn,npx,yarn-update-dep --allow-write=package.json,yarn.lock
+
+import { execFileSync } from "node:child_process";
+import { readFile } from "node:fs/promises";
+import { argv, exit } from "node:process";
+import lockfile from "npm:@yarnpkg/lockfile@1.1.0";
+import semver from "npm:semver@7.7.2";
+
+interface LockfileEntry {
+  version: string;
+  resolved: string;
+  integrity: string;
+  dependencies?: Record<string, string>;
+}
+
+interface AuditAdvisoryEntry {
+  title: string;
+  module_name: string;
+  vulnerable_versions: string;
+  patched_versions: string;
+}
+
+const [severity, ignoreTitlesPath] = argv.slice(2);
+if (!severity) {
+  console.error("Usage: yarn-audit-fix <severity> [ignore-titles-path]");
+  exit(1);
+}
+
+async function getAdvisoryEntries(): Promise<AuditAdvisoryEntry[]> {
+  let output = "";
+  try {
+    const stdout = execFileSync(
+      "yarn",
+      ["audit", "--level", severity, "--json"],
+      {
+        stdio: ["ignore", "pipe", "inherit"],
+      }
+    );
+    output = stdout.toString();
+  } catch (e: any) {
+    if (e.stdout) {
+      output = e.stdout.toString();
+    } else {
+      throw e;
+    }
+  }
+
+  let ignoreTitles: string[] = [];
+  if (ignoreTitlesPath) {
+    ignoreTitles = (await readFile(ignoreTitlesPath, "utf8"))
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line);
+  }
+
+  const entries = output
+    .toString()
+    .split("\n")
+    .filter((line) => line)
+    .map((line) => JSON.parse(line))
+    .map((obj) => obj?.data?.advisory)
+    .filter((obj): obj is AuditAdvisoryEntry => obj);
+
+  const entriesByKey = new Map<string, AuditAdvisoryEntry>();
+  for (const entry of entries) {
+    const key = `${entry.module_name}|${entry.vulnerable_versions}|${entry.patched_versions}`;
+    if (!entriesByKey.has(key)) {
+      entriesByKey.set(key, entry);
+    }
+  }
+
+  const uniqueEntries = Array.from(entriesByKey.values()).filter((entry) => {
+    if (!ignoreTitles.includes(entry.title)) {
+      return true;
+    }
+    console.log(`Ignoring: ${entry.title}`);
+    return false;
+  });
+  if (uniqueEntries.length === 0) {
+    console.log("No vulnerabilities found");
+    exit(0);
+  }
+
+  return uniqueEntries;
+}
+
+async function exec(file: string, ...args: string[]) {
+  console.log(`$ ${[file, ...args].join(" ")}`);
+  execFileSync(file, args, {
+    stdio: ["ignore", "inherit", "inherit"],
+  });
+}
+
+async function readYarnLock(): Promise<Record<string, LockfileEntry>> {
+  const { type, object: lockfileData } = lockfile.parse(
+    await readFile("yarn.lock", "utf8")
+  ) as { type: "success" | unknown; object: Record<string, LockfileEntry> };
+
+  if (type !== "success") {
+    throw new Error("Failed to parse yarn.lock");
+  }
+
+  return lockfileData;
+}
+
+async function main() {
+  const advisoryEntries = await getAdvisoryEntries();
+  for (const entry of advisoryEntries) {
+    const {
+      title,
+      module_name: moduleName,
+      patched_versions: patchedVersions,
+      vulnerable_versions: vulnerableVersions,
+    } = entry;
+
+    const patchedVersion = semver.minVersion(patchedVersions)?.toString();
+    if (!patchedVersion) {
+      console.warn(
+        `Could not determine minVersion for ${moduleName} with patchedVersions ${patchedVersions}`
+      );
+      continue;
+    }
+
+    console.log("Updating:", {
+      title,
+      moduleName,
+      vulnerableVersions,
+      patchedVersion,
+    });
+
+    await exec("yarn-update-dep", moduleName, patchedVersion);
+  }
+
+  const lockfileData = await readYarnLock();
+  for (const entry of advisoryEntries) {
+    const {
+      title,
+      module_name: moduleName,
+      patched_versions: patchedVersions,
+      vulnerable_versions: vulnerableVersions,
+    } = entry;
+
+    for (const [key, value] of Object.entries(lockfileData)) {
+      if (
+        key.startsWith(`${moduleName}@`) &&
+        semver.satisfies(value.version, vulnerableVersions)
+      ) {
+        console.warn("Couldn't update:", {
+          title,
+          moduleName,
+          currentVersion: value.version,
+          patchedVersions,
+        });
+      }
+    }
+  }
+}
+
+// @ts-ignore
+await main();

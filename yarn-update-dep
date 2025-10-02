@@ -1,0 +1,101 @@
+#!/usr/bin/env deno --allow-env --allow-sys --allow-read --allow-run=yarn,npx --allow-write=package.json,yarn.lock
+
+import { execFileSync } from "node:child_process";
+import { readFile, writeFile } from "node:fs/promises";
+import { argv, exit } from "node:process";
+import lockfile from "npm:@yarnpkg/lockfile@1.1.0";
+
+interface LockfileEntry {
+  version: string;
+  resolved: string;
+  integrity: string;
+  dependencies?: Record<string, string>;
+}
+
+const [moduleName, newVersion] = argv.slice(2);
+if (!moduleName || !newVersion) {
+  console.error("Usage: yarn-update-dep <module-name> <version>");
+  exit(1);
+}
+
+async function exec(file: string, ...args: string[]) {
+  console.log(`$ ${[file, ...args].join(" ")}`);
+  execFileSync(file, args, {
+    stdio: ["ignore", "inherit", "inherit"],
+  });
+}
+
+async function readYarnLock(): Promise<Record<string, LockfileEntry>> {
+  const { type, object: lockfileData } = lockfile.parse(
+    await readFile("yarn.lock", "utf8")
+  ) as { type: "success" | unknown; object: Record<string, LockfileEntry> };
+
+  if (type !== "success") {
+    throw new Error("Failed to parse yarn.lock");
+  }
+
+  return lockfileData;
+}
+
+async function main() {
+  let packageJsonSnapshot = await readFile("package.json", "utf8");
+  const packageJsonObj = JSON.parse(packageJsonSnapshot);
+
+  const oldPackageJsonRange =
+    packageJsonObj.dependencies?.[moduleName] ||
+    packageJsonObj.devDependencies?.[moduleName];
+  const newPackageJsonRange = oldPackageJsonRange
+    ? oldPackageJsonRange.startsWith("^")
+      ? `^${newVersion}`
+      : newVersion
+    : undefined;
+
+  await exec("yarn", "add", "--ignore-scripts", `${moduleName}@${newVersion}`);
+  await exec("npx", "yarn-deduplicate", "--strategy", "fewer");
+
+  if (newPackageJsonRange) {
+    if (packageJsonObj.dependencies?.[moduleName]) {
+      packageJsonObj.dependencies[moduleName] = newPackageJsonRange;
+    } else if (packageJsonObj.devDependencies?.[moduleName]) {
+      packageJsonObj.devDependencies[moduleName] = newPackageJsonRange;
+    }
+    packageJsonSnapshot = JSON.stringify(packageJsonObj, null, 2) + "\n";
+
+    const lockfileData = await readYarnLock();
+    let replaced = false;
+    for (const [key, value] of Object.entries(lockfileData)) {
+      if (key === `${moduleName}@${newVersion}`) {
+        delete lockfileData[key];
+        if (lockfileData[`${moduleName}@${newPackageJsonRange}`]) {
+          throw new Error(
+            `lockfile already has entry for ${moduleName}@${newPackageJsonRange}`
+          );
+        }
+        lockfileData[`${moduleName}@${newPackageJsonRange}`] = value;
+        replaced = true;
+      }
+    }
+    if (!replaced) {
+      throw new Error(`Could not find entry for ${moduleName}@${newVersion}`);
+    }
+    await writeFile("yarn.lock", lockfile.stringify(lockfileData));
+  }
+
+  await writeFile("package.json", packageJsonSnapshot);
+
+  await exec("yarn", "install", "--ignore-scripts");
+
+  const lockfileData = await readYarnLock();
+  for (const [key, value] of Object.entries(lockfileData)) {
+    if (key.startsWith(`${moduleName}@`) && value.version !== newVersion) {
+      console.warn("Couldn't update:", {
+        moduleName,
+        currentVersion: value.version,
+        newVersion,
+      });
+    }
+  }
+}
+
+// @ts-ignore
+await main();
