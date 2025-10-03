@@ -7,17 +7,25 @@ import lockfile from "npm:@yarnpkg/lockfile@1.1.0";
 import semver from "npm:semver@7.7.2";
 
 interface LockfileEntry {
-  version: string;
-  resolved: string;
-  integrity: string;
   dependencies?: Record<string, string>;
+  integrity: string;
+  resolved: string;
+  version: string;
 }
 
 interface AuditAdvisoryEntry {
-  title: string;
   module_name: string;
-  vulnerable_versions: string;
   patched_versions: string;
+  title: string;
+  vulnerable_versions: string;
+}
+
+interface AuditAdvisoryEntryUpdate {
+  moduleName: string;
+  patchedVersion: string;
+  patchedVersions: string;
+  title: string;
+  vulnerableVersions: string;
 }
 
 const [severity, ignoreTitlesPath] = argv.slice(2);
@@ -26,7 +34,7 @@ if (!severity) {
   exit(1);
 }
 
-async function getAdvisoryEntries(): Promise<AuditAdvisoryEntry[]> {
+async function getAdvisoryEntries(): Promise<AuditAdvisoryEntryUpdate[]> {
   let output = "";
   try {
     const stdout = execFileSync(
@@ -61,27 +69,54 @@ async function getAdvisoryEntries(): Promise<AuditAdvisoryEntry[]> {
     .map((obj) => obj?.data?.advisory)
     .filter((obj): obj is AuditAdvisoryEntry => obj);
 
-  const entriesByKey = new Map<string, AuditAdvisoryEntry>();
-  for (const entry of entries) {
-    const key = `${entry.module_name}|${entry.vulnerable_versions}|${entry.patched_versions}`;
-    if (!entriesByKey.has(key)) {
-      entriesByKey.set(key, entry);
+  const entriesByKey: Record<string, AuditAdvisoryEntryUpdate> = {};
+  for (const {
+    module_name: moduleName,
+    patched_versions: patchedVersions,
+    title,
+    vulnerable_versions: vulnerableVersions,
+  } of entries) {
+    if (ignoreTitles.includes(title)) {
+      console.log(`Ignoring: ${title}`);
+      continue;
     }
+
+    const patchedVersion = semver.minVersion(patchedVersions)?.toString();
+    if (!patchedVersion) {
+      console.warn(
+        `Could not determine minVersion for ${moduleName} with patchedVersions ${patchedVersions}`
+      );
+      continue;
+    }
+
+    if (
+      entriesByKey[moduleName]?.patchedVersion &&
+      semver.lt(patchedVersion, entriesByKey[moduleName].patchedVersion)
+    ) {
+      console.log(
+        `Skipping ${moduleName} with patchedVersion ${patchedVersion} because we already have ${entriesByKey[moduleName].patchedVersion}`
+      );
+      continue;
+    }
+
+    entriesByKey[moduleName] = {
+      moduleName,
+      patchedVersions,
+      title,
+      vulnerableVersions,
+      patchedVersion,
+    };
   }
 
-  const uniqueEntries = Array.from(entriesByKey.values()).filter((entry) => {
-    if (!ignoreTitles.includes(entry.title)) {
-      return true;
-    }
-    console.log(`Ignoring: ${entry.title}`);
-    return false;
-  });
-  if (uniqueEntries.length === 0) {
-    console.log("No vulnerabilities found");
+  if (Object.keys(entriesByKey).length === 0) {
+    console.log("No updatable vulnerabilities found");
     exit(0);
   }
 
-  return uniqueEntries;
+  const entryUpdates = Object.values(entriesByKey);
+  console.log(entryUpdates);
+
+  return entryUpdates;
 }
 
 async function exec(file: string, ...args: string[]) {
@@ -105,22 +140,12 @@ async function readYarnLock(): Promise<Record<string, LockfileEntry>> {
 
 async function main() {
   const advisoryEntries = await getAdvisoryEntries();
-  for (const entry of advisoryEntries) {
-    const {
-      title,
-      module_name: moduleName,
-      patched_versions: patchedVersions,
-      vulnerable_versions: vulnerableVersions,
-    } = entry;
-
-    const patchedVersion = semver.minVersion(patchedVersions)?.toString();
-    if (!patchedVersion) {
-      console.warn(
-        `Could not determine minVersion for ${moduleName} with patchedVersions ${patchedVersions}`
-      );
-      continue;
-    }
-
+  for (const {
+    moduleName,
+    patchedVersion,
+    title,
+    vulnerableVersions,
+  } of advisoryEntries) {
     console.log("Updating:", {
       title,
       moduleName,
@@ -132,14 +157,12 @@ async function main() {
   }
 
   const lockfileData = await readYarnLock();
-  for (const entry of advisoryEntries) {
-    const {
-      title,
-      module_name: moduleName,
-      patched_versions: patchedVersions,
-      vulnerable_versions: vulnerableVersions,
-    } = entry;
-
+  for (const {
+    moduleName,
+    patchedVersions,
+    title,
+    vulnerableVersions,
+  } of advisoryEntries) {
     for (const [key, value] of Object.entries(lockfileData)) {
       if (
         key.startsWith(`${moduleName}@`) &&
